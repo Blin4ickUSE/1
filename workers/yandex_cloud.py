@@ -41,8 +41,8 @@ DEFAULT_TIMEOUT = 60.0
 POLL_INTERVAL = 0.5
 POLL_MAX_WAIT = 120.0
 
-# Пауза между итерациями охоты: после удаления адреса, при ошибке API, на «защищённом» IP.
-HUNT_LOOP_PAUSE_SEC = 3.0
+# Пауза между операциями создания/удаления IP (1 сек между каждым действием).
+HUNT_LOOP_PAUSE_SEC = 1.0
 
 # VPC create/delete при 429 (rate limit): повторы и пауза.
 VPC_RATE_LIMIT_MAX_RETRIES = 10
@@ -466,20 +466,33 @@ async def run_ip_hunt(
     account_id: int | None = None,
 ) -> None:
     """
-    Цикл как в zalupa.sh: создать IP → проверить шаблоны → удалить или бинго.
+    Цикл: создать IP → ждать 1 сек → проверить шаблоны → удалить или бинго → ждать 1 сек.
+    Зоны перебираются по кругу: a → b → d → e → a → …
     При переданном dashboard счётчики и квота отражаются в одном сообщении (см. HuntDashboard).
     """
     count = 0
     important = (important_ip or "").strip()
     use_dash = dashboard is not None and account_id is not None
+
+    # Ротация зон по кругу, начиная с той, что выбрана в аккаунте (или с первой).
+    if zone_id in ZONES:
+        start_idx = ZONES.index(zone_id)
+    else:
+        start_idx = 0
+    zone_cycle = list(ZONES[start_idx:]) + list(ZONES[:start_idx])
+    zone_iter_idx = 0
+
     try:
         while True:
             count += 1
+            current_zone = zone_cycle[zone_iter_idx % len(zone_cycle)]
+            zone_iter_idx += 1
+
             if use_dash:
                 await dashboard.inc_attempt(account_id)
             try:
                 iam = await exchange_oauth_for_iam(oauth_token)
-                addr_id, ip = await create_external_address(iam, folder_id, zone_id)
+                addr_id, ip = await create_external_address(iam, folder_id, current_zone)
             except YandexCloudError as e:
                 if is_quota_error(str(e)):
                     if use_dash:
@@ -492,26 +505,37 @@ async def run_ip_hunt(
                         )
                     return
                 if use_dash:
-                    log.warning("yc hunt acc=%s iter=%s: %s", account_id, count, e)
+                    log.warning("yc hunt acc=%s iter=%s zone=%s: %s", account_id, count, current_zone, e)
                 else:
-                    await send_message(f"⚠️ Ошибка API (попытка {count}): {html_escape(str(e)[:400])}")
+                    await send_message(f"⚠️ Ошибка API (попытка {count}, зона {current_zone}): {html_escape(str(e)[:400])}")
                 await asyncio.sleep(HUNT_LOOP_PAUSE_SEC)
                 continue
+
+            # Пауза 1 сек после создания, перед проверкой/удалением.
+            await asyncio.sleep(HUNT_LOOP_PAUSE_SEC)
+
             if important and ip == important:
                 if not use_dash:
                     await send_message(
                         f"🛡 Защищённый IP (как в скрипте): <code>{html_escape(ip)}</code> — не трогаем, следующая итерация."
                     )
+                try:
+                    await delete_address(iam, addr_id)
+                except YandexCloudError:
+                    pass
                 await asyncio.sleep(HUNT_LOOP_PAUSE_SEC)
                 continue
+
             if ip_matches_any(ip, targets):
                 if use_dash:
                     await dashboard.inc_hit(account_id)
                     await dashboard.push_update()
                 await send_message(
-                    f"🎉 <b>Поймано!</b>\nIP: <code>{html_escape(ip)}</code>\nID: <code>{html_escape(addr_id)}</code>",
+                    f"🎉 <b>Поймано!</b>\nIP: <code>{html_escape(ip)}</code>\n"
+                    f"ID: <code>{html_escape(addr_id)}</code>\nЗона: <code>{html_escape(current_zone)}</code>",
                 )
                 return
+
             try:
                 await delete_address(iam, addr_id)
             except YandexCloudError as de:
@@ -520,11 +544,14 @@ async def run_ip_hunt(
                         f"⚠️ Не удалось удалить <code>{html_escape(ip)}</code>: {html_escape(str(de)[:200])}"
                     )
                 else:
-                    log.warning("yc delete failed acc=%s ip=%s: %s", account_id, ip, de)
+                    log.warning("yc delete failed acc=%s ip=%s zone=%s: %s", account_id, ip, current_zone, de)
+
             if count % 5 == 0 and not use_dash:
                 await send_message(
-                    f"… итерация {count}, последний IP: <code>{html_escape(ip)}</code> — не подошёл, удалён."
+                    f"… итерация {count}, зона {current_zone}, последний IP: <code>{html_escape(ip)}</code> — не подошёл, удалён."
                 )
+
+            # Пауза 1 сек после удаления, перед следующей итерацией.
             await asyncio.sleep(HUNT_LOOP_PAUSE_SEC)
     except asyncio.CancelledError:
         if notify_on_cancel:
